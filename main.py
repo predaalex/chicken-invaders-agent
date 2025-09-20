@@ -1,6 +1,3 @@
-import random
-import time
-
 import cv2
 import mss
 import numpy as np
@@ -11,13 +8,15 @@ import pygetwindow as gw
 import time
 from collections import deque
 
+from screen_grabber import ScreenGrabber
+
+
 class SmartFPS:
     def __init__(self, buffer_size=30):
         """
         buffer_size: how many most recent frames to average over.
                      Higher = smoother but slower to respond.
         """
-        buffer_size = buffer_size
         self._timestamps = deque(maxlen=buffer_size)
         self._start = None
 
@@ -65,16 +64,6 @@ def activate_window(window_title = "Chicken Invaders"):
 
     return window
 
-def get_bgr_frame(x1, y1, x2, y2):
-    """Return current BGR frame (HxWx3) of the game window."""
-    CROP = (x1, y1, x2, y2)
-    raw = screen_grabber.grab(CROP)              # ScreenShot object
-    frame = np.array(raw)                        # BGRA uint8
-    frame_bgr = frame[:, :, :3]                  # Drop alpha channel, still BGR
-    frage_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-
-    return frame_bgr, frage_gray
-
 def init_templates():
     ship_templates = []
     for p in ["resources/ship1.png", "resources/ship2.png", "resources/ship3.png"]:
@@ -113,13 +102,13 @@ def init_templates():
 
     return ship_templates, egg_templates
 
-def get_ship_position(gray_image, ship_position_x):
+def get_ship_position(gray_image, ship_position_x, game_window_height):
     """
-            g: grayscale cropped game frame (HxW, uint8)
-            returns smoothed player x (float, in [0,W))
-            """
-    band_h = int(0.25 * game_window.height)
-    band = gray_image[game_window.height - band_h:game_window.height, :]
+    g: grayscale cropped game frame (HxW, uint8)
+    returns smoothed player x (float, in [0,W))
+    """
+    band_h = int(0.25 * game_window_height)
+    band = gray_image[game_window_height - band_h:game_window_height, :]
 
     # ensure uint8 grayscale
     if band.ndim != 2:
@@ -368,27 +357,35 @@ def _sanitize_for_cv(img):
     return img
 
 def draw_overlay():
-    fps.update()
-    image = _sanitize_for_cv(bgr_frame)
+    image = gray_frame.copy()
+
     live_fps = fps.fps()
-    cv2.putText(image, f"{live_fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-    cv2.circle(image, (ship_position_x, ship_position_y), 5, (0, 0, 255), 2)
-    cv2.putText(image, f"{ship_position_score:.2f}", (ship_position_x + 5, ship_position_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+    cv2.putText(image, f"{live_fps:.2f} FPS", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+    cv2.circle(image, (int(ship_position_x), int(ship_position_y)), 7, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(image, f"{ship_position_score:.2f}",
+                (int(ship_position_x) + 8, int(ship_position_y) + 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
     for (cx, cy, r, sc) in eggs:
-        cv2.circle(image, (int(cx), int(cy)), max(2, int(r)), (255, 255, 255), 1)
-        cv2.putText(image, f"{sc:.2f}", (int(cx) + 6, int(cy) - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+        cx_i, cy_i = int(cx), int(cy)
+        cv2.circle(image, (cx_i, cy_i), max(2, int(r)), (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(image, f"{sc:.2f}", (cx_i + 6, cy_i - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
     cv2.imshow("Chicken Invaders", image)
 
 
 if __name__ == '__main__':
     # ------ CONFIG VARIABLES --------------
     debug = True
-    screen_grabber = mss.mss()
+    pydirectinput.FAILSAFE = False
     ship_templates, egg_templates = init_templates()
     fps = SmartFPS(buffer_size=30).start()  # rolling average over last 30 frames
     game_window = activate_window()
-    ship_position_x = int(game_window.left + game_window.width / 2)
+    screen_grabber = ScreenGrabber((game_window.top, game_window.left, game_window.width, game_window.height))
+    ship_position_x = int(game_window.left + game_window.width / 2)  # start in the middle
     ship_position_y = game_window.top + game_window.height - 80
     ship_position_score = 0.0
     eggs = []
@@ -397,10 +394,10 @@ if __name__ == '__main__':
     start_new_game()
 
     while True:
-        bgr_frame, gray_frame = get_bgr_frame(game_window.top, game_window.left, game_window.width, game_window.height)
-
-        ship_position_x, ship_position_score = get_ship_position(gray_frame, ship_position_x)
+        gray_frame = screen_grabber.grab()
+        ship_position_x, ship_position_score = get_ship_position(gray_frame, ship_position_x, game_window.height)
         eggs = get_eggs(gray_frame)
+
         if debug:
             draw_overlay()
             if cv2.waitKey(1) & 0xFF == 27:  # ESC to quit
