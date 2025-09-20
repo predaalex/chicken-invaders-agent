@@ -24,15 +24,14 @@ def get_frame(debug=False) -> np.ndarray:
 
     return frame_bgr
 
-def press(keys: Tuple[str, ...], hold_ms: int = 16):
-    """Hold these keys."""
-    for key in keys:
-        pydirectinput.keyDown(key)
+def hold(keys):
+    for k in keys:
+        pydirectinput.keyDown(k)
 
-def release(keys: Tuple[str, ...]):
-    """Release these keys."""
-    for key in keys:
-        pydirectinput.keyUp(key)
+def release(keys):
+    for k in keys:
+        pydirectinput.keyUp(k)
+
 # --------------------------------------------
 
 # ----- config you should set once -----
@@ -49,24 +48,45 @@ if not windows:
 
 window = windows[0]
 print(str(window) + f" FOUND {window_title}")
+window.activate()
 
 screen_grabber = mss.mss()
 CROP = (window.top, window.left,window.width, window.height)   # (x0,y0,x1,y1) -> set to your game’s inner playfield
-PLAYER_Y_REL = 0.88       # player row as a fraction of cropped height (≈ bottom)
+PLAYER_Y_REL = 0.95       # player row as a fraction of cropped height (≈ bottom)
 CAP_FPS = 21              # tune to your capture rate
-MOVE_HOLD_MS = 12         # how long to hold a direction per decision
-# --------------------------------------
 
-@dataclass
-class Egg:
-    x: float
-    y: float
-    vx: float
-    vy: float
-    r: float  # approx radius (for risk width)
+pydirectinput.PAUSE = 0      # avoid the 0.1s default delay
+pydirectinput.FAILSAFE = False
+keys_down = tuple()
+# --------------------------------------
+class PulseMover:
+    """
+    Sends short key presses ("pulses") for movement.
+    - hold_ms: how long to hold each key press
+    - min_gap_ms: minimum gap between pulses of the SAME direction
+    """
+    def __init__(self, hold_ms=22, min_gap_ms=10):
+        self.hold_ms = hold_ms
+        self.min_gap = min_gap_ms / 1000.0
+        self._last_pulse = {"left": 0.0, "right": 0.0}
+
+    def _pulse(self, key: str):
+        pydirectinput.keyDown(key)
+        time.sleep(self.hold_ms / 1000.0)
+        pydirectinput.keyUp(key)
+        self._last_pulse[key] = time.time()
+
+    def maybe_pulse(self, direction: str):
+        now = time.time()
+        if direction not in ("left", "right"):
+            return  # neutral: do nothing (no keys are held anyway)
+        if now - self._last_pulse[direction] >= self.min_gap:
+            self._pulse(direction)
+
 
 class SimpleDodger:
     def __init__(self, width: int, height: int):
+        self.player_x_score = None
         self.W, self.H = width, height
         self.prev_eggs: List[Tuple[float,float]] = []  # previous centroids for velocity
         self.player_x: Optional[float] = None
@@ -75,9 +95,9 @@ class SimpleDodger:
 
         # tunables for player matching
         self.band_height_frac = 0.25  # search bottom 25%
-        self.scales = [1.0, 1.05, 0.95]  # multi-scale search
-        self.min_conf = 0.9  # confidence threshold for a valid match
-        self.smooth = 0.1  # EMA smoothing factor
+        self.scales = [0.95, 1.00, 1.05]  # multi-scale search
+        self.min_conf = 0.45  # confidence threshold for a valid match
+        self.smooth = 0.3  # EMA smoothing factor
         self.ship_templates = []
         for p in ["resources/ship1.png", "resources/ship2.png", "resources/ship3.png"]:
             t = cv2.imread(p, cv2.IMREAD_UNCHANGED)  # supports alpha
@@ -120,9 +140,9 @@ class SimpleDodger:
         self.nms_iou = 0.35
 
         self.max_vert_horizon = int(0.6 * self.H)  # ignore eggs very far above player
-        self.dist_decay_px = 90.0  # larger -> slower decay with dy
-        self.base_sigma_px = 10.0  # base horizontal risk width
-        self.size_sigma_k = 1.2  # how much radius inflates sigma
+        self.dist_decay_px = 50.0  # larger -> slower decay with dy
+        self.base_sigma_px = 1.0  # base horizontal risk width
+        self.size_sigma_k = 1.12  # how much radius inflates sigma
         self.dist_sigma_k = 0.02  # widen sigma with vertical distance
         self.min_score_weight = 0.3  # lower bound for weak detections
 
@@ -163,63 +183,108 @@ class SimpleDodger:
     # --- player detection (bottom band, bright blob fallback) ---
     def detect_player_x(self, g: np.ndarray) -> float:
         """
-        g: grayscale cropped game frame (HxW)
+        g: grayscale cropped game frame (HxW, uint8)
         returns smoothed player x (float, in [0,W))
         """
-        band_h = int(self.band_height_frac * self.H)
-        band = g[self.H - band_h:self.H, :]  # bottom band
-        # Optional: small blur to reduce noise
-        band_blur = cv2.GaussianBlur(band, (3, 3), 0)
+        band_h = int(getattr(self, "band_height_frac", 0.25) * self.H)
+        band = g[self.H - band_h:self.H, :]
 
-        best = {
-            "score": -1.0,
-            "x": None,
-            "y": None,
-            "w": None,
-            "h": None
-        }
+        # ensure uint8 grayscale
+        if band.ndim != 2:
+            band = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+        if band.dtype != np.uint8:
+            band = band.astype(np.uint8)
+
+        # mild blur helps both intensity & edges
+        band_blur = cv2.GaussianBlur(band, (3, 3), 0)
+        band_edges = cv2.Canny(band_blur, 60, 120)
+
+        prev_px = self.player_x
+        prior_sigma = float(getattr(self, "player_prior_sigma_px", 60.0))  # how strongly to prefer near previous x
+        mix_alpha = float(getattr(self, "ship_match_mix_alpha", 0.7))  # 0..1: weight for intensity vs edges
+
+        best = {"score": -1.0, "x": None, "y": None, "w": None, "h": None}
 
         for tpl_gray, mask in self.ship_templates:
-            for s in self.scales:
-                if s != 1.0:
-                    tw = max(1, int(tpl_gray.shape[1] * s))
-                    th = max(1, int(tpl_gray.shape[0] * s))
-                    tpl_s = cv2.resize(tpl_gray, (tw, th), interpolation=cv2.INTER_AREA)
-                    msk_s = cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST) if mask is not None else None
-                else:
-                    tpl_s, msk_s = tpl_gray, mask
+            # templates must be uint8 grayscale
+            t = tpl_gray
+            if t.ndim != 2:
+                t = cv2.cvtColor(t, cv2.COLOR_BGR2GRAY)
+            if t.dtype != np.uint8:
+                t = t.astype(np.uint8)
 
-                # template must fit inside band
-                if band_blur.shape[0] < tpl_s.shape[0] or band_blur.shape[1] < tpl_s.shape[1]:
+            for s in getattr(self, "scales", [0.9, 1.0, 1.1]):
+                tw = max(1, int(t.shape[1] * s))
+                th = max(1, int(t.shape[0] * s))
+                tpl_s = cv2.resize(t, (tw, th), interpolation=cv2.INTER_AREA)
+                if band_blur.shape[0] < th or band_blur.shape[1] < tw:
                     continue
 
-                # Use TM_CCORR_NORMED when using a mask (OpenCV limitation)
-                method = cv2.TM_CCORR_NORMED if msk_s is not None else cv2.TM_CCOEFF_NORMED
-                res = cv2.matchTemplate(band_blur, tpl_s, method, mask=msk_s)
-                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                # mask handling
+                msk_s = None
+                use_mask = False
+                if mask is not None:
+                    msk_s = cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST)
+                    _, msk_s = cv2.threshold(msk_s, 10, 255, cv2.THRESH_BINARY)
+                    if msk_s.dtype != np.uint8:
+                        msk_s = msk_s.astype(np.uint8)
+                    # skip degenerate masks
+                    if int(np.count_nonzero(msk_s)) < 12:
+                        msk_s = None
+                    else:
+                        use_mask = True
 
-                score = max_val if method in (cv2.TM_CCORR_NORMED, cv2.TM_CCOEFF_NORMED) else 1.0 - min_val
+                # -------- intensity match --------
+                # with mask: use SQDIFF_NORMED (lower is better), then invert to [0..1] "higher better"
+                if use_mask:
+                    res_i = cv2.matchTemplate(band_blur, tpl_s, cv2.TM_SQDIFF_NORMED, mask=msk_s)
+                    conf_i = 1.0 - np.clip(np.nan_to_num(res_i, nan=1.0, posinf=1.0, neginf=1.0), 0.0, 1.0)
+                else:
+                    # no mask: use CCOEFF_NORMED
+                    res_i = cv2.matchTemplate(band_blur, tpl_s, cv2.TM_CCOEFF_NORMED)
+                    conf_i = np.clip(np.nan_to_num(res_i, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0)
+
+                # -------- edge match (unmasked) --------
+                tpl_edges = cv2.Canny(tpl_s, 60, 120)
+                res_e = cv2.matchTemplate(band_edges, tpl_edges, cv2.TM_CCOEFF_NORMED)
+                conf_e = np.clip(np.nan_to_num(res_e, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0)
+
+                # -------- blend intensity + edges --------
+                conf = mix_alpha * conf_i + (1.0 - mix_alpha) * conf_e
+
+                # -------- apply soft prior around previous x --------
+                if prev_px is not None and prior_sigma > 1.0:
+                    # build a per-column prior centered at prev_px; add 0.5 floor so it's soft
+                    xs = (np.arange(conf.shape[1], dtype=np.float32) + tw / 2.0)
+                    prior = 0.5 + 0.5 * np.exp(-0.5 * ((xs - float(prev_px)) / prior_sigma) ** 2)
+                    conf *= prior[None, :]
+
+                # sanitize (should already be 0..1)
+                conf = np.clip(conf, 0.0, 1.0)
+
+                # pick best location for this template+scale
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(conf)
+                score = float(max_val)
                 if score > best["score"]:
+                    x, y = max_loc
                     best["score"] = score
-                    top_left = max_loc if method in (cv2.TM_CCORR_NORMED, cv2.TM_CCOEFF_NORMED) else min_loc
-                    x, y = top_left
-                    best["x"] = x + tpl_s.shape[1] / 2.0
-                    best["y"] = y + tpl_s.shape[0] / 2.0
-                    best["w"] = tpl_s.shape[1]
-                    best["h"] = tpl_s.shape[0]
+                    best["x"] = x + tw / 2.0
+                    best["y"] = y + th / 2.0
+                    best["w"] = tw
+                    best["h"] = th
 
-        if best["score"] >= self.min_conf and best["x"] is not None:
-            # convert band coords to full image coords (x is the same; y offset if you need it)
-            px = float(best["x"])
+        # threshold + smoothing + safety
+        min_conf = float(getattr(self, "min_conf", 0.55))
+        if (best["x"] is not None) and (best["score"] >= min_conf):
+            px = float(np.clip(best["x"], 0.0, self.W - 1.0))
         else:
             # fallback to previous or center
             px = self.player_x if self.player_x is not None else self.W / 2.0
 
-        # exponential moving average smoothing
-        if self.player_x is None:
-            self.player_x = px
-        else:
-            self.player_x = self.smooth * self.player_x + (1.0 - self.smooth) * px
+        # EMA smoothing (prevents jitter even if best jumps a bit)
+        smooth = float(getattr(self, "smooth", 0.8))
+        self.player_x = px if self.player_x is None else (smooth * self.player_x + (1.0 - smooth) * px)
+        self.player_x_score = float(best["score"] if np.isfinite(best["score"]) else 0.0)
 
         return float(self.player_x)
 
@@ -229,6 +294,9 @@ class SimpleDodger:
         px = self.player_x if self.player_x is not None else self.W / 2
         vis = cv2.cvtColor(band, cv2.COLOR_GRAY2BGR)
         cv2.circle(vis, (int(px), int(0.5 * band.shape[0])), 6, (0, 255, 0), 2)
+        cv2.putText(vis, f"{self.player_x_score:.2f}", (int(px) + 6, int(0.5 * band.shape[0]) + 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
+
         cv2.imshow(win_name, vis)
 
     # --- egg detection (white ovals moving down) ---
@@ -328,7 +396,7 @@ class SimpleDodger:
             eggs.append((cx, cy, r, sc))
         return eggs
 
-    def debug_eggs_overlay(self, g: np.ndarray, eggs):
+    def debug_eggs_overlay(self, g: np.ndarray, eggs, win_name="Eggs"):
         """
         g: grayscale crop
         eggs: list of (cx, cy, r, score)
@@ -339,78 +407,70 @@ class SimpleDodger:
             cv2.circle(vis, (int(cx), int(cy)), max(2, int(r)), (255, 255, 255), 1)
             cv2.putText(vis, f"{sc:.2f}", (int(cx) + 6, int(cy) - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
-        return vis
+
+        cv2.imshow(win_name, vis)
 
     # --- build 1-D risk map over x by projecting to player y ---
-    def risk_map(self, eggs):
-        """
-        eggs: list of (cx, cy, r, score) in crop coords
-        returns: 1D risk array length W (float32)
-        """
-        W = self.W
-        x_axis = np.arange(W, dtype=np.float32)
-        risk = np.zeros(W, dtype=np.float32)
-        py = self.player_y
 
-        # tunables
-        max_vert_horizon = getattr(self, "max_vert_horizon", int(0.6 * self.H))
-        dist_decay_px = getattr(self, "dist_decay_px", 90.0)
-        base_sigma_px = getattr(self, "base_sigma_px", 10.0)
-        size_sigma_k = getattr(self, "size_sigma_k", 1.2)
-        dist_sigma_k = getattr(self, "dist_sigma_k", 0.02)
-        min_score_weight = getattr(self, "min_score_weight", 0.3)
-        max_weight_cap = getattr(self, "max_weight_cap", 1.5)  # limits a single egg’s influence
+    def risk_map(
+            self,
+            eggs: List[Tuple[float, float, float, float]],  # (x, y, r, sc)
+            max_distance: float = 300.0,
+            base_sigma: float = 10.0,
+            sigma_scale: float = 1.2,
+            min_weight: float = 0.2,
+            edge_penalty_high: float = 3.0,
+            edge_penalty_low: float = 2.0,
+            edge_fraction: float = 1 / 5.0,
+            # NEW params
+            dist_mode: str = "linear",  # "linear" | "inv2" | "exp"
+            d_max: float = 350.0,  # for "linear"
+            d0: float = 120.0,  # for "inv2"
+            lam: float = 140.0  # for "exp"
+    ) -> np.ndarray:
+        x_axis = np.arange(self.W, dtype=np.float32)
+        risk = np.zeros(self.W, dtype=np.float32)
+        py = self.player_y
+        px = float(self.player_x if self.player_x is not None else self.W / 2)
 
         for (x, y, r, sc) in eggs:
-            # guards
-            if not (np.isfinite(x) and np.isfinite(y) and np.isfinite(r) and np.isfinite(sc)):
+            # your existing vertical gate
+            t = py - y
+            if t > max_distance:
                 continue
 
-            dy = float(py - y)
-            if dy <= 0 or dy > max_vert_horizon:
-                continue
+            # Gaussian column under the egg (same as before)
+            sigma = base_sigma + sigma_scale * r
+            gauss = np.exp(-0.5 * ((x_axis - x) / sigma) ** 2)
 
-            # clamp x to image bounds (prevents off-screen centers)
-            x = float(np.clip(x, 0.0, W - 1.0))
+            # ---- NEW: distance-based weight to the ship ----
+            d_vert = t
+            d_horiz = abs(x - px)
+            d = (d_vert ** 2 + d_horiz ** 2) ** 0.5
 
-            # weight = confidence * distance decay
-            sc = float(np.clip(sc, 0.0, 1.0))
-            w = max(min_score_weight, sc) * np.exp(-dy / max(1e-3, dist_decay_px))
-            w = float(np.clip(w, 0.0, max_weight_cap))
+            if dist_mode == "linear":
+                w_dist = max(min_weight, 1.0 - d / max(1.0, d_max))
+            elif dist_mode == "inv2":
+                w_dist = max(min_weight, 1.0 / (1.0 + (d / max(1.0, d0)) ** 2))
+            else:  # "exp"
+                w_dist = max(min_weight, float(np.exp(-d / max(1.0, lam))))
 
-            # gaussian width
-            sigma = base_sigma_px + size_sigma_k * float(r) + dist_sigma_k * dy
-            sigma = float(np.clip(np.nan_to_num(sigma, nan=10.0), 3.0, 1000.0))
+            w_dist *= 4
 
-            # add contribution
-            z = (x_axis - x) / sigma
-            gauss = np.exp(-0.5 * (z * z)).astype(np.float32)
-            risk += (w * gauss)
+            # (optional) also keep your original vertical weighting (closer vertically → more risk)
+            w_vert = max(min_weight, 1.0 - t / max_distance)
 
-        # scale-aware edge penalty (small, relative)
-        if W >= 6:
-            edge_w = W // 6
-            edge = np.linspace(1.0, 0.6, edge_w, dtype=np.float32)  # gentle
-            # scale by current median to avoid overpowering
-            scale = np.median(risk) if np.any(risk > 0) else 1.0
-            risk[:edge_w] += scale * edge[::-1] * 0.25
-            risk[-edge_w:] += scale * edge * 0.25
+            # final weight = distance modulator × your original vertical weight
+            w = w_dist * w_vert
 
-        # sanitize
-        risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            risk += (w * gauss).astype(np.float32)
 
-        # optional: normalize for the debug heatbar (comment out if you want raw)
-        denom = float(risk.max())
-        if denom > 0:
-            risk = risk / denom
-
-        # optional: temporal EMA to reduce flicker (store on self)
-        alpha = getattr(self, "risk_ema_alpha", 0.6)  # 0.6 = fairly smooth
-        prev = getattr(self, "_risk_prev", None)
-        if prev is not None and prev.shape[0] == risk.shape[0]:
-            risk = alpha * prev + (1.0 - alpha) * risk
-        self._risk_prev = risk.copy()
-
+        # edge penalties (unchanged)
+        edge_width = int(self.W * edge_fraction)
+        if edge_width > 0:
+            edge = np.linspace(edge_penalty_high, edge_penalty_low, edge_width)
+            risk[:edge_width] += edge
+            risk[-edge_width:] += edge[::-1]
         return risk
 
     # --- choose target x and action ---
@@ -580,16 +640,16 @@ class SimpleDodger:
         """
         vis = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
 
-        # player row
-        py = self.player_y
-        cv2.line(vis, (0, py), (self.W - 1, py), (50, 50, 50), 1)
-        cv2.circle(vis, (int(px), py), 6, (0, 255, 0), 2)
-
-        # eggs
-        for (cx, cy, r, sc) in eggs:
-            cv2.circle(vis, (int(cx), int(cy)), max(2, int(r)), (255, 255, 255), 1)
-            cv2.putText(vis, f"{sc:.2f}", (int(cx) + 6, int(cy) - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+        # # player row
+        # py = self.player_y
+        # cv2.line(vis, (0, py), (self.W - 1, py), (50, 50, 50), 1)
+        # cv2.circle(vis, (int(px), py), 6, (0, 255, 0), 2)
+        #
+        # # eggs
+        # for (cx, cy, r, sc) in eggs:
+        #     cv2.circle(vis, (int(cx), int(cy)), max(2, int(r)), (255, 255, 255), 1)
+        #     cv2.putText(vis, f"{sc:.2f}", (int(cx) + 6, int(cy) - 6),
+        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
 
         # risk strip
         strip = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
@@ -614,6 +674,7 @@ def run_dodger(show_debug=True):
 
     last_release = time.time()
     keys_down: Tuple[str,...] = tuple()
+    mover = PulseMover(hold_ms=45, min_gap_ms=5)  # tune these two
 
     try:
         while True:
@@ -624,29 +685,18 @@ def run_dodger(show_debug=True):
             bot.debug_player_overlay(roi_g)
 
             eggs = bot.detect_eggs(roi_g)
-            # bot.debug_eggs_overlay(roi_g, eggs)
+            bot.debug_eggs_overlay(roi_g, eggs)
 
             risk = bot.risk_map(eggs)
             act = bot.choose_action(px, risk)
 
-            # input policy: brief taps with small hold; auto-release
             if act == "left":
-                if keys_down != ("left",):
-                    if keys_down: release(keys_down)
-                    press(("left",), hold_ms=MOVE_HOLD_MS)
-                    keys_down = ("left",)
-                    last_release = time.time()
+                mover.maybe_pulse("left")
             elif act == "right":
-                if keys_down != ("right",):
-                    if keys_down: release(keys_down)
-                    press(("right",), hold_ms=MOVE_HOLD_MS)
-                    keys_down = ("right",)
-                    last_release = time.time()
+                mover.maybe_pulse("right")
             else:
-                # neutral
-                if keys_down and (time.time() - last_release) > (MOVE_HOLD_MS/1000.0):
-                    release(keys_down)
-                    keys_down = tuple()
+                # neutral -> no pulses this frame
+                pass
 
             if show_debug:
                 vis = bot.draw_overlay(roi_g, eggs, px, risk)
@@ -655,7 +705,7 @@ def run_dodger(show_debug=True):
                     break
 
             # simple pacing to ~CAP_FPS
-            time.sleep(max(0, 1.0/CAP_FPS - 0.001))
+            time.sleep(max(0.0, 1.0/CAP_FPS - 0.001))
     finally:
         if keys_down:
             release(keys_down)
